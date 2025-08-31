@@ -1,0 +1,135 @@
+name: Claude AI Development Assistant (VibeCoding)
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      request:
+        description: 'Development request for Claude'
+        required: true
+        type: string
+
+jobs:
+  claude-development:
+    runs-on: ubuntu-latest
+    if: contains(github.event.issue.title, '[CLAUDE]') || github.event_name == 'workflow_dispatch' || contains(github.event.comment.body, '@claude')
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Get Repository Context
+        id: repo-context
+        run: |
+          echo "FILES_STRUCTURE<<EOF" >> $GITHUB_OUTPUT
+          find . -type f \( -name "*.tsx" -o -name "*.ts" -o -name "*.js" -o -name "*.jsx" \) \
+            -not -path "./node_modules/*" -not -path "./.git/*" | head -20 >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Process Claude Request
+        id: claude-request
+        uses: actions/github-script@v7
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const comment = context.payload.comment;
+            const workflowInput = context.payload.inputs;
+            
+            let request = '';
+            if (issue && issue.title.includes('[CLAUDE]')) {
+              request = issue.body;
+            } else if (comment && comment.body.includes('@claude')) {
+              request = comment.body.replace('@claude', '').trim();
+            } else if (workflowInput) {
+              request = workflowInput.request;
+            }
+            
+            const claudeContext = {
+              repository: context.repo,
+              request: request,
+              files_structure: process.env.FILES_STRUCTURE,
+              package_json: require('fs').readFileSync('package.json', 'utf8'),
+              project_type: 'nextjs-supabase',
+              deployment_platform: 'railway'
+            };
+            
+            const response = await fetch(process.env.SUPABASE_URL + '/functions/v1/claude-github-integration', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + process.env.SUPABASE_SERVICE_ROLE_KEY,
+                'apikey': process.env.SUPABASE_ANON_KEY
+              },
+              body: JSON.stringify(claudeContext)
+            });
+            
+            if (!response.ok) {
+              throw new Error(`Claude API failed: ${response.status}`);
+            }
+            
+            const claudeResponse = await response.json();
+            core.setOutput('claude_response', JSON.stringify(claudeResponse));
+
+      - name: Apply Claude Changes
+        if: steps.claude-request.outputs.claude_response
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const claudeResponse = JSON.parse('${{ steps.claude-request.outputs.claude_response }}');
+            const fs = require('fs');
+            const path = require('path');
+            
+            for (const file of claudeResponse.files || []) {
+              const dir = path.dirname(file.path);
+              if (dir !== '.') {
+                fs.mkdirSync(dir, { recursive: true });
+              }
+              fs.writeFileSync(file.path, file.content);
+              console.log(`✅ ${file.action}: ${file.path}`);
+            }
+
+      - name: Build and Test
+        run: |
+          if npm run build; then
+            echo "✅ Build successful"
+          else
+            echo "❌ Build failed"
+            exit 1
+          fi
+
+      - name: Commit Changes
+        run: |
+          git config --local user.email "claude@vibecoding.com"
+          git config --local user.name "Claude AI Assistant"
+          
+          git add .
+          if ! git diff --cached --quiet; then
+            git commit -m "🤖 Claude AI: ${{ github.event.issue.title || github.event.comment.body || inputs.request }}"
+            git push
+            echo "✅ Changes committed and deployed"
+          fi
+
+      - name: Deploy to Vercel
+        run: |
+          echo "🚀 Deploying to Vercel..."
+          npx vercel --prod --token ${{ secrets.VERCEL_TOKEN }} --confirm
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
